@@ -180,6 +180,172 @@ core::PlanNodePtr SubstraitVeloxPlanConverter::toVeloxPlan(
       childNode);
 }
 
+core::PlanNodePtr SubstraitVeloxPlanConverter::toVeloxPlan(const ::substrait::SortRel& sortRel) {
+  core::PlanNodePtr childNode;
+  if (sortRel.has_input()) {
+    childNode = toVeloxPlan(sortRel.input());
+  } else {
+    VELOX_FAIL("Child Rel is expected in SortRel.");
+  }
+
+  std::vector<core::FieldAccessTypedExprPtr> keys;
+  std::vector<core::SortOrder> orders;
+
+  for (const auto& sort : sortRel.sorts()) {
+    if (!sort.expr().has_selection()) {
+      // The plan is overly logical
+      VELOX_FAIL("Sort keys must be direct field references");
+    }
+    core::FieldAccessTypedExprPtr key = exprConverter_->toVeloxExpr(sort.expr().selection(), childNode->outputType());
+    keys.push_back(std::move(key));
+
+    if (sort.has_direction()) {
+      switch (sort.direction()) {
+        case ::substrait::SortField::SORT_DIRECTION_ASC_NULLS_FIRST:
+          orders.emplace_back(/*ascending=*/true, /*nullsFirst=*/true);
+          break;
+        case ::substrait::SortField::SORT_DIRECTION_ASC_NULLS_LAST:
+          orders.emplace_back(/*ascending=*/true, /*nullsFirst=*/false);
+          break;
+        case ::substrait::SortField::SORT_DIRECTION_DESC_NULLS_FIRST:
+          orders.emplace_back(/*ascending=*/false, /*nullsFirst=*/true);
+          break;
+        case ::substrait::SortField::SORT_DIRECTION_DESC_NULLS_LAST:
+          orders.emplace_back(/*ascending=*/false, /*nullsFirst=*/false);
+          break;
+        default:
+          VELOX_NYI("Sort direction not yet supported.");
+      }
+    } else {
+      VELOX_NYI("Sorts with custom functions not yet supported.");
+    }
+  }
+
+  // TODO: Is hardcoding isPartial=false correct?
+  return std::make_shared<core::OrderByNode>(nextPlanNodeId(), keys, orders, /*isPartial=*/false, childNode);
+}
+
+core::PlanNodePtr SubstraitVeloxPlanConverter::toVeloxPlan(const ::substrait::JoinRel& joinRel) {
+  core::PlanNodePtr leftNode;
+  core::PlanNodePtr rightNode;
+  if (joinRel.has_left()) {
+    leftNode = toVeloxPlan(joinRel.left());
+  } else {
+    VELOX_FAIL("Left Rel is expected in JoinRel.");
+  }
+  if (joinRel.has_right()) {
+    rightNode = toVeloxPlan(joinRel.right());
+  } else {
+    VELOX_FAIL("Right Rel is expected in JoinRel.");
+  }
+
+  if (joinRel.has_post_join_filter()) {
+    // TODO: Velox supports this and it should be simple enough
+    // but no producers produce this yet
+    VELOX_NYI("Post join filter not yet implemented");
+  }
+
+  if (!joinRel.expression().has_scalar_function()) {
+    // TODO: Support physical join rel
+    VELOX_FAIL("Expect join expression to be a simple equality expression");
+  }
+
+  const RowTypePtr& leftOut = leftNode->outputType();
+  const RowTypePtr& rightOut = rightNode->outputType();
+
+  std::vector<std::string> combinedNames(leftOut->names().begin(), leftOut->names().end());
+  combinedNames.insert(combinedNames.end(), rightOut->names().begin(), rightOut->names().end());
+
+  std::vector<TypePtr> combinedTypes(leftOut->children().begin(), leftOut->children().end());
+  combinedTypes.insert(combinedTypes.end(), rightOut->children().begin(), rightOut->children().end());
+
+  RowTypePtr combinedRowType = ROW(std::move(combinedNames), std::move(combinedTypes));
+
+  core::FieldAccessTypedExprPtr leftRef;
+  core::FieldAccessTypedExprPtr rightRef;
+
+  core::TypedExprPtr joinExpr = exprConverter_->toVeloxExpr(joinRel.expression(), combinedRowType);
+  if (auto joinCall = std::dynamic_pointer_cast<const core::CallTypedExpr>(joinExpr)) {
+    if (joinCall->inputs().size() != 2) {
+      VELOX_FAIL("Join expression must be an equality call with 2 inputs");
+    }
+    const core::TypedExprPtr& leftExpr = joinCall->inputs()[0];
+    const core::TypedExprPtr& rightExpr = joinCall->inputs()[1];
+    if (auto leftRefCast = std::dynamic_pointer_cast<const core::FieldAccessTypedExpr>(leftExpr)) {
+      leftRef = leftRefCast;
+    } else {
+      VELOX_FAIL("Expected the left side of the join expression call to be a field reference");
+    }
+    if (auto rightRefCast = std::dynamic_pointer_cast<const core::FieldAccessTypedExpr>(rightExpr)) {
+      rightRef = rightRefCast;
+    } else {
+      VELOX_FAIL("Expected the right side of the join expression call to be a field reference");
+    }
+  } else {
+    VELOX_FAIL("Join expression must be a scalar function call to the equals function");
+  }
+
+  core::JoinType joinType;
+
+  switch (joinRel.type()) {
+    case ::substrait::JoinRel::JoinType::JoinRel_JoinType_JOIN_TYPE_LEFT:
+      joinType = core::JoinType::kLeft;
+      break;
+    case ::substrait::JoinRel::JoinType::JoinRel_JoinType_JOIN_TYPE_ANTI:
+      joinType = core::JoinType::kAnti;
+      break;
+    case ::substrait::JoinRel::JoinType::JoinRel_JoinType_JOIN_TYPE_INNER:
+      joinType = core::JoinType::kInner;
+      break;
+    case ::substrait::JoinRel::JoinType::JoinRel_JoinType_JOIN_TYPE_OUTER:
+      // TODO? Suppported?  I assume this is just some combination of join types
+      VELOX_NYI("Outer join not yet supported");
+    case ::substrait::JoinRel::JoinType::JoinRel_JoinType_JOIN_TYPE_RIGHT:
+      joinType = core::JoinType::kRight;
+      break;
+    case ::substrait::JoinRel::JoinType::JoinRel_JoinType_JOIN_TYPE_SEMI:
+      // TODO: There are a lot of semi-join types in velox.  Which is it?
+      VELOX_NYI("Semi join not yet supported");
+    default:
+      VELOX_NYI("Join type not supported");
+  }
+
+  std::vector<core::FieldAccessTypedExprPtr> leftRefs{leftRef};
+  std::vector<core::FieldAccessTypedExprPtr> rightRefs{rightRef};
+  core::TypedExprPtr filter;
+
+  return std::make_shared<core::HashJoinNode>(
+    nextPlanNodeId(),
+    joinType,
+    leftRefs,
+    rightRefs,
+    filter,
+    leftNode,
+    rightNode,
+    combinedRowType);
+}
+
+core::PlanNodePtr SubstraitVeloxPlanConverter::toVeloxPlan(const ::substrait::FetchRel& fetchRel) {
+  core::PlanNodePtr inputNode;
+  if (fetchRel.has_input()) {
+    inputNode = toVeloxPlan(fetchRel.input());
+  } else {
+    VELOX_FAIL("Input Rel is expected in FetchRel.");
+  }
+
+  int32_t offset = static_cast<int32_t>(fetchRel.offset());
+  int32_t count = static_cast<int32_t>(fetchRel.count());
+
+  // TODO: Is isPartial=false always correct?
+  return std::make_shared<core::LimitNode>(
+    nextPlanNodeId(),
+    offset,
+    count,
+    /*isPartial=*/false,
+    inputNode
+  );
+}
+
 core::PlanNodePtr SubstraitVeloxPlanConverter::toVeloxPlan(
     const ::substrait::ReadRel& readRel,
     std::shared_ptr<SplitInfo>& splitInfo) {
@@ -224,6 +390,10 @@ core::PlanNodePtr SubstraitVeloxPlanConverter::toVeloxPlan(
           splitInfo->format = dwio::common::FileFormat::UNKNOWN;
       }
     }
+  } else if (readRel.has_named_table()) {
+    // TODO: Use provided schema to narrow down / reorder columns from provided row vector?
+    std::vector<std::string> names(readRel.named_table().names().begin(), readRel.named_table().names().end());
+    return namedTableHandler_(names, nextPlanNodeId(), ROW(std::move(colNameList), std::move(veloxTypeList)));
   }
 
   // Do not hard-code connector ID and allow for connectors other than Hive.
@@ -353,7 +523,16 @@ core::PlanNodePtr SubstraitVeloxPlanConverter::toVeloxPlan(
     splitInfoMap_[planNode->id()] = splitInfo;
     return planNode;
   }
-  VELOX_NYI("Substrait conversion not supported for Rel.");
+  if (rel.has_sort()) {
+    return toVeloxPlan(rel.sort());
+  }
+  if (rel.has_join()) {
+    return toVeloxPlan(rel.join());
+  }
+  if (rel.has_fetch()) {
+    return toVeloxPlan(rel.fetch());
+  }
+  VELOX_NYI("Substrait conversion not supported for Rel: " + std::to_string(rel.rel_type_case()));
 }
 
 core::PlanNodePtr SubstraitVeloxPlanConverter::toVeloxPlan(

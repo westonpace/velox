@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include <functional>
+
 #include "velox/connectors/hive/HiveConnector.h"
 #include "velox/core/PlanNode.h"
 #include "velox/substrait/SubstraitToVeloxExpr.h"
@@ -25,8 +27,10 @@ namespace facebook::velox::substrait {
 /// This class is used to convert the Substrait plan into Velox plan.
 class SubstraitVeloxPlanConverter {
  public:
-  explicit SubstraitVeloxPlanConverter(memory::MemoryPool* pool)
-      : pool_(pool) {}
+  using NamedTableHandler = std::function<core::PlanNodePtr(const std::vector<std::string>&, const core::PlanNodeId&, RowTypePtr)>;
+
+  explicit SubstraitVeloxPlanConverter(memory::MemoryPool* pool, NamedTableHandler namedTableHandler = {})
+      : pool_(pool), namedTableHandler_(std::move(namedTableHandler)) {}
   struct SplitInfo {
     /// The Partition index.
     u_int32_t partitionIndex;
@@ -65,6 +69,15 @@ class SubstraitVeloxPlanConverter {
   core::PlanNodePtr toVeloxPlan(
       const ::substrait::ReadRel& readRel,
       const RowTypePtr& type);
+
+  /// Convert Substrait SortRel into Velox OrderByNode.
+  core::PlanNodePtr toVeloxPlan(const ::substrait::SortRel& sortRel);
+
+  /// Convert Substrait JoinRel into Velox HashJoinNode.
+  core::PlanNodePtr toVeloxPlan(const ::substrait::JoinRel& joinRel);
+
+  /// Convert Substrait FetchRel into Velox LimitNode.
+  core::PlanNodePtr toVeloxPlan(const ::substrait::FetchRel& fetchRel);
 
   /// Convert Substrait Rel into Velox PlanNode.
   core::PlanNodePtr toVeloxPlan(const ::substrait::Rel& rel);
@@ -142,6 +155,9 @@ class SubstraitVeloxPlanConverter {
 
   /// Memory pool.
   memory::MemoryPool* pool_;
+
+  /// Optional function to provide values for named tables
+  NamedTableHandler namedTableHandler_;
 };
 
 } // namespace facebook::velox::substrait
