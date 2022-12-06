@@ -17,7 +17,10 @@
 #include "velox/substrait/tests/JsonToProtoConverter.h"
 
 #include "velox/common/base/tests/GTestUtils.h"
+#include "velox/connectors/Connector.h"
 #include "velox/dwio/common/tests/utils/DataFiles.h"
+#include "velox/exec/Exchange.h"
+#include "velox/exec/PartitionedOutputBufferManager.h"
 #include "velox/exec/tests/utils/AssertQueryBuilder.h"
 #include "velox/exec/tests/utils/HiveConnectorTestBase.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
@@ -30,8 +33,87 @@ using namespace facebook::velox::test;
 using namespace facebook::velox::connector::hive;
 using namespace facebook::velox::exec;
 
+class MockExchangeSource : public facebook::velox::exec::ExchangeSource {
+ public:
+  MockExchangeSource(
+      const std::string& taskId,
+      int destination,
+      std::shared_ptr<ExchangeQueue> queue,
+      memory::MemoryPool* FOLLY_NONNULL pool,
+      RowVectorPtr table)
+      : facebook::velox::exec::ExchangeSource(taskId, destination, queue, pool), table_(table) {}
+
+  bool shouldRequestLocked() override {
+    if (atEnd_) {
+      return false;
+    }
+    return true;
+  }
+
+  std::unique_ptr<SerializedPage> toSerializedPage(VectorPtr vector) {
+    auto data = std::make_unique<VectorStreamGroup>(facebook::velox::memory::MemoryAllocator::getInstance());
+    auto size = vector->size();
+    auto range = IndexRange{0, size};
+    data->createStreamTree(
+        std::dynamic_pointer_cast<const RowType>(vector->type()), size);
+    data->append(
+        std::dynamic_pointer_cast<RowVector>(vector), folly::Range(&range, 1));
+    auto weakBufferManager = facebook::velox::exec::PartitionedOutputBufferManager::getInstance();
+    if (auto bufferManager = weakBufferManager.lock()) {
+        auto listener = bufferManager->newListener();
+        IOBufOutputStream stream(*facebook::velox::memory::MemoryAllocator::getInstance(), listener.get(), data->size());
+        data->flush(&stream);
+        return std::make_unique<SerializedPage>(stream.getIOBuf());
+    }
+    VELOX_FAIL("No PartitionedOutputBufferManager instance");
+  }
+
+  void request() override {
+    std::lock_guard<std::mutex> l(queue_->mutex());
+    atEnd_ = true;
+    requestPending_ = false;
+    sequence_++;
+    queue_->enqueue(toSerializedPage(table_));
+    queue_->enqueue(nullptr);
+  }
+
+  void close() override {
+    auto buffers = PartitionedOutputBufferManager::getInstance().lock();
+    buffers->deleteResults(taskId_, destination_);
+  }
+
+ private:
+  RowVectorPtr table_;
+};
+
+std::unordered_map<std::string, RowVectorPtr>& getMockTablesMap() {
+    static std::unordered_map<std::string, RowVectorPtr> mockTablesMap;
+    return mockTablesMap;
+}
+
+std::unique_ptr<facebook::velox::exec::ExchangeSource> createMockExchangeSource(
+    const std::string& taskId,
+    int destination,
+    std::shared_ptr<facebook::velox::exec::ExchangeQueue> queue,
+    facebook::velox::memory::MemoryPool* FOLLY_NONNULL pool) {
+  if (strncmp(taskId.c_str(), "mock://", 7) == 0) {
+    auto table = getMockTablesMap()[taskId];
+    return std::make_unique<MockExchangeSource>(
+        taskId, destination, std::move(queue), pool, table);
+  }
+  return nullptr;
+}
+
 class Substrait2VeloxPlanConversionTest
     : public exec::test::HiveConnectorTestBase {
+
+ public:
+
+   void TearDown() override {
+     getMockTablesMap().clear();
+     exec::test::HiveConnectorTestBase::TearDown();
+   }
+
  protected:
   std::vector<std::shared_ptr<facebook::velox::connector::ConnectorSplit>>
   makeSplits(
@@ -64,6 +146,13 @@ class Substrait2VeloxPlanConversionTest
       splits.emplace_back(split);
     }
     return splits;
+  }
+
+  std::vector<std::shared_ptr<facebook::velox::connector::ConnectorSplit>>
+  makeNamedTableSplits(
+      const facebook::velox::substrait::SubstraitVeloxPlanConverter& converter,
+      std::shared_ptr<const core::PlanNode> planNode) {
+        return {};
   }
 
   std::shared_ptr<exec::test::TempDirectoryPath> tmpDir_{
@@ -285,4 +374,100 @@ TEST_F(Substrait2VeloxPlanConversionTest, q6) {
   exec::test::AssertQueryBuilder(planNode)
       .splits(makeSplits(planConverter, planNode))
       .assertResults(expectedResult);
+}
+
+// This test runs a simple query against in-memory data using a named table
+// The Substrait plan is a hard-coded JSON file and contains two schemas with
+// the expected named tables:
+//
+// "0": { "l_id": INTEGER, "left": DOUBLE }
+// "1": { "r_id": INTEGER, "right": DOUBLE }
+//
+// The query is roughly:
+//
+//  SELECT t1.l_id, t1.left, t2.right FROM "0" AS t1
+//  INNER JOIN "1" AS t2 ON t1.l_id = t2.r_id
+//  ORDER BY t1.l_id
+//  LIMIT 2
+//
+//  Tested Velox operators: ValuesNode (Named Table), Join, OrderBy, Limit.
+TEST_F(Substrait2VeloxPlanConversionTest, namedTable) {
+  facebook::velox::exec::ExchangeSource::registerFactory(createMockExchangeSource);
+
+  auto leftTypes = ROW({"l_id", "left"}, {INTEGER(), DOUBLE()}); // table 0
+  auto rightTypes = ROW({"r_id", "right"}, {INTEGER(), DOUBLE()}); // table 1
+  auto outTypes = ROW({"l_id", "left", "right"}, {INTEGER(), DOUBLE(), DOUBLE()}); // expected output
+
+  std::shared_ptr<memory::MemoryPool> pool{memory::getDefaultMemoryPool()};
+  std::vector<VectorPtr> leftVectors(2);
+  std::vector<VectorPtr> rightVectors(2);
+  std::vector<VectorPtr> outVectors(3);
+  leftVectors[0] = makeFlatVector<int32_t>({0, 1, 2, 3});
+  leftVectors[1] = makeFlatVector<double>({10.0, 10.1, 10.2, 10.3});
+  rightVectors[0] = makeFlatVector<int32_t>({3, 2, 1, 0});
+  rightVectors[1] = makeFlatVector<double>({20.3, 20.2, 20.1, 20.0});
+  // Only contains the first two due to the LIMIT 2
+  outVectors[0] = makeFlatVector<int32_t>({0, 1});
+  outVectors[1] = makeFlatVector<double>({10.0, 10.1});
+  outVectors[2] = makeFlatVector<double>({20.0, 20.1});
+
+  RowVectorPtr left = makeRowVector(leftTypes->names(), leftVectors);
+  RowVectorPtr right = makeRowVector(rightTypes->names(), rightVectors);
+  RowVectorPtr expected = makeRowVector(outTypes->names(), outVectors);
+
+  getMockTablesMap().clear();
+  getMockTablesMap()["mock://0"] = left;
+  getMockTablesMap()["mock://1"] = right;
+
+  // Find and deserialize Substrait plan json file.
+  std::string planPath =
+      getDataFilePath("velox/substrait/tests", "data/named_table.json");
+  ::substrait::Plan substraitPlan;
+  JsonToProtoConverter::readFromFile(planPath, substraitPlan);
+
+  std::unordered_map<facebook::velox::core::PlanNodeId, std::string> splitInfos;
+
+  facebook::velox::substrait::SubstraitVeloxPlanConverter::NamedTableHandler namedTableHandler = 
+  [&] (const std::vector<std::string>& names,
+       const facebook::velox::core::PlanNodeId& planNodeId,
+       RowTypePtr rowType) -> facebook::velox::core::PlanNodePtr {
+    if (names.size() != 1) {
+        VELOX_FAIL("Expected to receive one name for each table in this test"); 
+    }
+    core::PlanNodePtr node = std::make_shared<core::ExchangeNode>(planNodeId, std::move(rowType));
+    splitInfos[node->id()] = "mock://" + names[0];
+    return node;
+  };
+
+//   facebook::velox::substrait::SubstraitVeloxPlanConverter::NamedTableHandler namedTableHandler = 
+//   [&] (const std::vector<std::string>& names,
+//        const facebook::velox::core::PlanNodeId& planNodeId,
+//        RowTypePtr rowType) -> facebook::velox::core::PlanNodePtr {
+//     if (names.size() != 1) {
+//         VELOX_FAIL("Expected to receive one name for each table in this test"); 
+//     }
+//     RowVectorPtr table;
+//     if (names[0] == "0") {
+//         table = left;
+//     } else if (names[0] == "1") {
+//         table = right;
+//     } else {
+//         VELOX_FAIL("Expected to receive a table named '0' or '1'");
+//     }
+//     std::vector<RowVectorPtr> tables{std::move(table)};
+//     return std::make_shared<core::ValuesNode>(planNodeId, std::move(tables));
+//   };
+
+  // Convert to Velox PlanNode.
+  facebook::velox::substrait::SubstraitVeloxPlanConverter planConverter(
+      pool_.get(), std::move(namedTableHandler));
+  auto planNode = planConverter.toVeloxPlan(substraitPlan);
+
+  exec::test::AssertQueryBuilder assertBuilder(planNode);
+  for (const auto& splitInfo : splitInfos) {
+    assertBuilder.split(splitInfo.first, std::make_shared<facebook::velox::exec::RemoteConnectorSplit>(splitInfo.second));
+  }
+  assertBuilder.assertResults(expected);
+
+  getMockTablesMap().clear();
 }
